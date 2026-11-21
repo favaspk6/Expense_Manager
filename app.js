@@ -7,8 +7,8 @@
             Chart.defaults.font.family = "'Inter', ui-sans-serif, system-ui, sans-serif";
         }
 
-        const SUPABASE_URL = 'https://eghvqigfmcohvlstnajw.supabase.co';
-        const SUPABASE_ANON_KEY = 'sb_publishable_SB6dXxf5bfzdpKL69IOMqQ_F9ETe580';
+        const SUPABASE_URL = 'https://ngkmqtqzmvkfzvwegflf.supabase.co';
+        const SUPABASE_ANON_KEY = 'sb_publishable_RXdmwR8oCdgfOak4SbPqPA_ASVAH4hx';
         // Password-reset links land back on this page with the result in the URL hash.
         // Read it NOW, before supabase-js processes it, so boot() knows we arrived from a reset email.
         let recoveryPending = /type=recovery/.test(window.location.hash);
