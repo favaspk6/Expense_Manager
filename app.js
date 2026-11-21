@@ -112,6 +112,19 @@
         let financialPeriod = 'month';
         let currentReportTransactions = [];
         const customTransactionTypes = [];
+        // "Feels like": every transaction type behaves like one of four built-in kinds. Custom types
+        // (e.g. 'Annual Fee' -> Purchase, 'Deposit' -> Repaid) are mapped here; 'None' = record only.
+        const TX_KINDS = ['Purchase', 'Cash Withdrawal', 'Repaid', 'Cashback'];
+        const customTypeBehavior = {};
+        function txKind(type) {
+            if (TX_KINDS.includes(type)) return type;
+            const k = customTypeBehavior[type];
+            return TX_KINDS.includes(k) ? k : null;
+        }
+        const isSpendKind = type => { const k = txKind(type); return k === 'Purchase' || k === 'Cash Withdrawal'; };
+        function persistTypeBehaviors() {
+            try { localStorage.setItem('cb_custom_type_behaviors', JSON.stringify(customTypeBehavior)); } catch (e) { /* private mode */ }
+        }
 
         // ---- HISTORY TABLE: sort, pagination, bulk-select ----
         let txSortColumn = 'date';
@@ -721,7 +734,7 @@
             return Number.isInteger(day) && day >= 1 && day <= 31 ? day : 1;
         }
         function isImmediateCashbackTransaction(tx) {
-            return tx.type === 'Cashback' || tx.category === 'Cashback';
+            return txKind(tx.type) === 'Cashback' || tx.category === 'Cashback';
         }
         function cashbackCreditDate(tx, card = resolveCardForTransaction(tx)) {
             const date = tx.date || '';
@@ -756,9 +769,9 @@
                 const fee = parseFloat(t.serviceCharge) || 0;
 
                 const immediateCashback = isImmediateCashbackTransaction(t);
-                if (!immediateCashback && t.type === 'Purchase') r.purchases += amount;
-                else if (!immediateCashback && t.type === 'Cash Withdrawal') r.withdrawals += amount;
-                else if (!immediateCashback && t.type === 'Repaid') r.repaid += amount;
+                if (!immediateCashback && txKind(t.type) === 'Purchase') r.purchases += amount;
+                else if (!immediateCashback && txKind(t.type) === 'Cash Withdrawal') r.withdrawals += amount;
+                else if (!immediateCashback && txKind(t.type) === 'Repaid') r.repaid += amount;
                 r.fees += fee;
 
                 if (immediateCashback) {
@@ -1106,6 +1119,9 @@
 
         async function loadCustomSettings() {
             try {
+                Object.assign(customTypeBehavior, JSON.parse(localStorage.getItem('cb_custom_type_behaviors') || '{}'));
+            } catch (error) { /* ignore */ }
+            try {
                 applyCustomSettings(
                     JSON.parse(localStorage.getItem('cb_custom_transaction_types') || '[]'),
                     JSON.parse(localStorage.getItem('cb_custom_categories') || '[]')
@@ -1114,10 +1130,13 @@
                 console.warn('Could not read cached custom settings:', error);
             }
             if (_supabase && currentUserId) {
-                const { data, error } = await _supabase
+                let { data, error } = await _supabase
                     .from('shared_options')
-                    .select('kind, name')
+                    .select('kind, name, behaves_like')
                     .order('created_at', { ascending: true });
+                if (error && /behaves_like/.test(error.message || '')) { // column not added yet: fall back to the old query
+                    ({ data, error } = await _supabase.from('shared_options').select('kind, name').order('created_at', { ascending: true }));
+                }
                 if (error) {
                     console.warn('Could not load shared_options from Supabase (table missing?):', error.message);
                 } else if (data) {
@@ -1125,6 +1144,8 @@
                         data.filter(r => r.kind === 'transaction_type').map(r => r.name),
                         data.filter(r => r.kind === 'category').map(r => r.name)
                     );
+                    data.filter(r => r.kind === 'transaction_type' && r.behaves_like).forEach(r => { customTypeBehavior[r.name] = r.behaves_like; });
+                    persistTypeBehaviors();
                     localStorage.setItem('cb_custom_transaction_types', JSON.stringify(customTransactionTypes));
                     localStorage.setItem('cb_custom_categories', JSON.stringify(customCategories));
                 }
@@ -1133,12 +1154,25 @@
 
         // Insert ONE shared option. A duplicate (same kind + name, any case) is treated as success.
         let warnedMissingSettingsTable = false;
-        async function saveSharedOption(kind, name) {
+        let warnedMissingBehaviorColumn = false;
+        async function saveSharedOption(kind, name, behavesLike) {
             localStorage.setItem('cb_custom_transaction_types', JSON.stringify(customTransactionTypes));
             localStorage.setItem('cb_custom_categories', JSON.stringify(customCategories));
             if (!_supabase || !currentUserId) return true;
-            const { error } = await _supabase.from('shared_options')
-                .insert({ kind, name, created_by: currentUserId });
+            const row = { kind, name, created_by: currentUserId };
+            if (kind === 'transaction_type' && behavesLike) row.behaves_like = behavesLike;
+            let { error } = await _supabase.from('shared_options').insert(row);
+            if (error && 'behaves_like' in row && /behaves_like/.test(error.message || '')) {
+                delete row.behaves_like; // column missing: save the type itself, keep the behaviour on this device
+                if (!warnedMissingBehaviorColumn) {
+                    warnedMissingBehaviorColumn = true;
+                    alert('The type was saved, but its "Feels like" setting is only remembered on this device until you run this once in the Supabase SQL editor:\n\n' +
+                          "alter table public.shared_options add column if not exists behaves_like text check (behaves_like in ('Purchase','Cash Withdrawal','Repaid','Cashback','None'));\n" +
+                          "create policy shared_options_update on public.shared_options for update to authenticated using (created_by = auth.uid() or public.is_admin()) with check (created_by = auth.uid() or public.is_admin());\n" +
+                          "grant update on public.shared_options to authenticated;");
+                }
+                ({ error } = await _supabase.from('shared_options').insert(row));
+            }
             if (error && error.code !== '23505') {
                 console.error('Saving shared option failed:', error);
                 if (!warnedMissingSettingsTable) {
@@ -1159,8 +1193,15 @@
                 .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'shared_options' }, payload => {
                     const r = payload.new || {};
                     if (r.kind === 'category') applyCustomSettings([], [r.name]);
-                    else if (r.kind === 'transaction_type') applyCustomSettings([r.name], []);
+                    else if (r.kind === 'transaction_type') { applyCustomSettings([r.name], []); if (r.behaves_like) { customTypeBehavior[r.name] = r.behaves_like; persistTypeBehaviors(); } }
                     refreshOptionUI();
+                })
+                .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'shared_options' }, payload => {
+                    const r = payload.new || {};
+                    if (r.kind === 'transaction_type' && r.behaves_like) {
+                        customTypeBehavior[r.name] = r.behaves_like; persistTypeBehaviors();
+                        refreshOptionUI(); render();
+                    }
                 })
                 .subscribe();
         }
@@ -1228,13 +1269,24 @@
                 showToast('That transaction type already exists.');
                 return;
             }
+            const chosen = document.querySelector('input[name="new-type-behavior"]:checked');
+            if (!chosen) {
+                showToast('Choose what this type feels like: Purchase or Repaid.', { tone: 'error', duration: 4500 });
+                const group = document.getElementById('new-transaction-type-behavior-group');
+                if (group) group.scrollIntoView({ block: 'nearest' });
+                return;
+            }
+            const behavior = chosen.value;
             TYPE_FILTER_OPTIONS.push(value);
             customTransactionTypes.push(value);
-            saveSharedOption('transaction_type', value);
+            customTypeBehavior[value] = behavior;
+            persistTypeBehaviors();
+            saveSharedOption('transaction_type', value, behavior);
             populateTransactionTypes();
             renderTypeFilter();
             input.value = '';
-            showToast(`Added transaction type: ${value}`, { tone: 'success' });
+            chosen.checked = false; // next type starts with nothing selected
+            showToast(`Added transaction type: ${value} (feels like ${behavior === 'None' ? 'nothing — record only' : behavior})`, { tone: 'success' });
             returnToTransactionSettingsSelection('type', value);
         }
 
@@ -1371,6 +1423,20 @@
             if (label) label.textContent = debit ? 'Current Balance' : 'Available Limit';
             if (input) input.placeholder = debit ? 'e.g., 5000 (balance in the account today)' : 'e.g., 15000';
             if (dates) dates.classList.toggle('hidden', debit);
+            // Debit cards have no fees or cashback: hide those sections and disable their inputs
+            // (disabled inputs are skipped by form validation, so hidden 'required' fields can't block saving).
+            ['card-rules-section', 'card-rates-section'].forEach(id => {
+                const section = document.getElementById(id);
+                if (!section) return;
+                section.style.display = debit ? 'none' : '';
+                section.querySelectorAll('input, select, textarea, button').forEach(el => {
+                    if (debit) {
+                        if (!el.disabled) { el.disabled = true; el.dataset.ddDebitOff = '1'; }
+                    } else if (el.dataset.ddDebitOff) {
+                        el.disabled = false; delete el.dataset.ddDebitOff;
+                    }
+                });
+            });
         }
         // In the transaction form, 'Repaid' reads as 'Deposit / top-up' while a debit card is selected (stored value stays 'Repaid').
         function syncRepaidLabel() {
@@ -1379,6 +1445,14 @@
             if (!sel || !opt) return;
             const debit = isDebit(cards.find(c => String(c.id) === String(sel.value)));
             opt.textContent = debit ? 'Deposit / top-up' : 'Repaid';
+            const row = document.getElementById('exp-fee-cashback-row');
+            if (row) {
+                row.style.display = debit ? 'none' : '';
+                if (debit) {
+                    document.getElementById('exp-service').value = '';
+                    document.getElementById('exp-cashback').value = '0.00';
+                }
+            }
         }
         ['exp-card'].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', syncRepaidLabel); });
         ['mousedown', 'touchstart', 'focus'].forEach(ev => { const el = document.getElementById('exp-type'); if (el) el.addEventListener(ev, syncRepaidLabel); });
@@ -1470,10 +1544,10 @@
                 const cashback = parseFloat(t.cashback) || 0;
                 const amount = parseFloat(t.amount) || 0;
                 cb += cashback;
-                if (t.type === 'Purchase' || t.type === 'Cash Withdrawal') spend += amount;
+                if (txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal') spend += amount;
                 if ((t.date || '').startsWith(currentMonth)) {
                     mtdCb += cashback;
-                    if (t.type === 'Purchase' || t.type === 'Cash Withdrawal') mtdSpend += amount;
+                    if (txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal') mtdSpend += amount;
                 }
             });
             const ret = spend > 0 ? (cb / spend) * 100 : 0;
@@ -2195,18 +2269,18 @@
             const cardId = document.getElementById('exp-card').value;
             const cashbackInput = document.getElementById('exp-cashback');
 
-            if (type === 'Cashback' || category === 'Cashback') {
+            if (txKind(type) === 'Cashback' || category === 'Cashback' || isDebit(cards.find(c => c.id === cardId))) {
                 cashbackInput.value = '0.00';
                 return;
             }
 
             // Force cashback to 0.00 for Repaid entries regardless of category selection
-            if (type === 'Repaid') {
+            if (txKind(type) === 'Repaid') {
                 cashbackInput.value = '0.00';
                 return;
             }
 
-            if (type === 'Purchase' || type === 'Cash Withdrawal') {
+            if (isSpendKind(type)) {
                 if (!category) {
                     // "None / Default" — no category means no rate to apply, so no cashback.
                     // Pick an actual category if this purchase should earn something.
@@ -2222,7 +2296,7 @@
                         const month = (document.getElementById('exp-date').value || localDateKey()).slice(0, 7);
                         const editingId = document.getElementById('editing-tx-id').value;
                         const monthTx = cardTxList(selectedCard).filter(t => t.id !== editingId && (t.date || '').startsWith(month));
-                        const spent = ddSum(monthTx.filter(t => t.type === 'Purchase' || t.type === 'Cash Withdrawal'), t => t.amount);
+                        const spent = ddSum(monthTx.filter(t => txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'), t => t.amount);
                         eligibleSpend = Math.min(amount, Math.max(0, ddNum(selectedCard.availableLimit) - spent));
                     }
                     let cashbackValue = eligibleSpend * (rate / 100);
@@ -2303,6 +2377,7 @@
                 } catch (err) { /* localStorage may be unavailable (e.g. private mode) — safe to skip */ }
             }
 
+            syncRepaidLabel();
             // Description is the next thing that needs typing (date/type/card already have
             // sensible defaults), so put the cursor there.
             setTimeout(() => document.getElementById('exp-desc').focus(), 50);
@@ -2343,7 +2418,7 @@
             // day) has no spend amount of its own, so don't force one to be entered.
             const amountInput = document.getElementById('exp-amount');
             const amountLabel = document.getElementById('exp-amount-label');
-            if (typeVal === 'Cashback') {
+            if (txKind(typeVal) === 'Cashback') {
                 amountInput.required = false;
                 amountInput.min = '0';
                 amountInput.placeholder = '0.00 (optional)';
@@ -2371,7 +2446,7 @@
         }
 
         function updateImmediateCashbackNote() {
-            const isCashback = document.getElementById('exp-type').value === 'Cashback' ||
+            const isCashback = txKind(document.getElementById('exp-type').value) === 'Cashback' ||
                 document.getElementById('exp-category').value === 'Cashback';
             document.getElementById('exp-immediate-cashback-note').classList.toggle('hidden', !isCashback);
         }
@@ -2657,7 +2732,7 @@
                         const amount = parseFloat(row['Amount']);
                         const serviceCharge = parseFloat(row['Service Charge']) || parseFloat(row['Service Fee']) || 0;
                         const cashbackRaw = row['Cashback'];
-                        const cashback = (type === 'Repaid' || cashbackRaw === '-' || cashbackRaw === '' || cashbackRaw === undefined) ? 0 : parseFloat(cashbackRaw);
+                        const cashback = (txKind(type) === 'Repaid' || cashbackRaw === '-' || cashbackRaw === '' || cashbackRaw === undefined) ? 0 : parseFloat(cashbackRaw);
                         const notes = row['Notes'] || '';
 
                         // A row with no card name and no usable amount is not salvageable — skip it
@@ -2768,17 +2843,17 @@
                 alert('Statement Day and Payment Day must be whole numbers between 1 and 31, or left blank.');
                 return;
             }
-            const cashbackCreditMode = document.querySelector('input[name="card-cashback-mode"]:checked').value;
+            const cashbackCreditMode = cardType === 'debit' ? 'monthly' : document.querySelector('input[name="card-cashback-mode"]:checked').value;
             const cashbackCreditDayInput = document.getElementById('card-cashback-credit-day');
-            const cashbackCreditDay = Number(cashbackCreditDayInput.value);
-            if (cashbackCreditMode === 'monthly' &&
+            const cashbackCreditDay = cardType === 'debit' ? 1 : Number(cashbackCreditDayInput.value);
+            if (cardType !== 'debit' && cashbackCreditMode === 'monthly' &&
                 (!Number.isInteger(cashbackCreditDay) || cashbackCreditDay < 1 || cashbackCreditDay > 31)) {
                 alert('Cashback credit day must be a whole number between 1 and 31.');
                 cashbackCreditDayInput.focus();
                 return;
             }
 
-            const rates = getCardRatesFromForm();
+            const rates = cardType === 'debit' ? {} : getCardRatesFromForm();
             const colorGradient = document.getElementById('card-color-gradient').value || null;
             const network = document.getElementById('card-network').value;
             const netVariant = document.getElementById('card-network-variant').value.trim();
@@ -2898,13 +2973,14 @@
             const desc = document.getElementById('exp-desc').value;
             const amount = parseFloat(document.getElementById('exp-amount').value) || 0;
             const category = document.getElementById('exp-category').value;
-            const serviceCharge = parseFloat(document.getElementById('exp-service').value) || 0;
-            const cashback = type === 'Repaid' ? 0 : (parseFloat(document.getElementById('exp-cashback').value) || 0);
             const cardId = document.getElementById('exp-card').value;
+            const cardForFees = cards.find(c => c.id === cardId);
+            const serviceCharge = isDebit(cardForFees) ? 0 : (parseFloat(document.getElementById('exp-service').value) || 0);
+            const cashback = (txKind(type) === 'Repaid' || isDebit(cardForFees)) ? 0 : (parseFloat(document.getElementById('exp-cashback').value) || 0);
 
             const selectedCard = cards.find(c => c.id === cardId);
 
-            if (isDebit(selectedCard) && (type === 'Purchase' || type === 'Cash Withdrawal')) {
+            if (isDebit(selectedCard) && isSpendKind(type)) {
                 const bal = debitBalance(selectedCard, localDateKey(), editingTxId);
                 const needed = amount + (INCLUDE_FEES_IN_OUTSTANDING ? serviceCharge : 0);
                 if (needed > bal + 0.005) {
@@ -2916,7 +2992,7 @@
                     if (!proceed) return;
                 }
             }
-            if (selectedCard && !isDebit(selectedCard) && (type === 'Purchase' || type === 'Cash Withdrawal')) {
+            if (selectedCard && !isDebit(selectedCard) && isSpendKind(type)) {
                 const maxAllowedSpend = (selectedCard.availableLimit || 0) * 0.97;
                 const monthKey = date ? date.substring(0, 7) : new Date().toISOString().substring(0, 7);
                 
@@ -2924,7 +3000,7 @@
                     .filter(t => t.id !== editingTxId &&
                                  t.cardName.trim().toLowerCase() === selectedCard.name.trim().toLowerCase() && 
                                  t.date && t.date.startsWith(monthKey) && 
-                                 (t.type === 'Purchase' || t.type === 'Cash Withdrawal'))
+                                 (txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'))
                     .reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
 
                 if (currentMonthCardSpend + amount > maxAllowedSpend) {
@@ -3784,11 +3860,11 @@
                 const label = k === 'All' ? 'overall monthly cashback' : escapeHtml(k);
                 L.push(`<span class="${left <= 0 ? 'text-red-400' : ''}">${left <= 0 ? '⛔ ' + label + ' cap reached' : 'AED ' + formatAED(left) + ' cap left on ' + label}</span>`);
             });
-            if (ddNum(r.minSpend)) { const sp = ddSum(mTx.filter(t => t.type === 'Purchase' || t.type === 'Cash Withdrawal'), t => t.amount); L.push(`Min spend: AED ${formatAED(sp)} / ${formatAED(ddNum(r.minSpend))}${sp >= ddNum(r.minSpend) ? ' ✓' : ''}`); }
+            if (ddNum(r.minSpend)) { const sp = ddSum(mTx.filter(t => txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'), t => t.amount); L.push(`Min spend: AED ${formatAED(sp)} / ${formatAED(ddNum(r.minSpend))}${sp >= ddNum(r.minSpend) ? ' ✓' : ''}`); }
             const ws = ddYearWindow(r);
             if (ddNum(r.fee)) {
                 const yt = txs.filter(t => t.date >= (ws || '0000'));
-                const sp = ddSum(yt.filter(t => t.type === 'Purchase' || t.type === 'Cash Withdrawal'), t => t.amount), cb = ddSum(yt, t => t.cashback);
+                const sp = ddSum(yt.filter(t => txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'), t => t.amount), cb = ddSum(yt, t => t.cashback);
                 if (ddNum(r.waiver)) L.push(`Fee waiver: AED ${formatAED(sp)} / ${formatAED(ddNum(r.waiver))} (${Math.min(100, sp / ddNum(r.waiver) * 100).toFixed(0)}%)${sp >= ddNum(r.waiver) ? ' ✓ waived' : ''}`);
                 if (cb < ddNum(r.fee) && !(ddNum(r.waiver) && sp >= ddNum(r.waiver))) L.push(`<span class="text-amber-400">⚠ Fee AED ${formatAED(ddNum(r.fee))} exceeds cashback AED ${formatAED(cb)} this year</span>`);
             }
@@ -3820,7 +3896,7 @@
             const limit = Math.max(0, ddNum(card.availableLimit));
             const usesMonthlySpend = ddRule(card).limitCashbackSpendToMonthlyLimit !== false;
             const used = usesMonthlySpend
-                ? ddSum(monthTxs.filter(t => t.type === 'Purchase' || t.type === 'Cash Withdrawal'), t => t.amount)
+                ? ddSum(monthTxs.filter(t => txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'), t => t.amount)
                 : Math.max(0, calculateOutstanding(cardTxList(card), localDateKey(), card).outstanding);
             return {
                 amount: Math.max(0, limit - used),
@@ -3938,7 +4014,7 @@
             const ym = localDateKey().slice(0, 7);
             const monthTxs = cardTxList(card).filter(t => (t.date || '').startsWith(ym));
             const monthSpend = ddSum(monthTxs.filter(t =>
-                t.type === 'Purchase' || t.type === 'Cash Withdrawal'
+                txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'
             ), t => t.amount);
             const limit = Math.max(0, ddNum(card.availableLimit));
             const availability = ddWithdrawalAvailability(card, monthTxs);
@@ -4298,7 +4374,7 @@
                 const need = Math.max(0, out - lim * target / 100);
                 const utilization = lim ? Math.min(100, out / lim * 100) : 0;
                 pay += `<tr class="border-t border-white/5"><td class="py-3 pr-4 font-medium text-slate-200">${escapeHtml(c.name)}</td><td class="w-2/5 py-3 pr-4"><div class="flex items-center gap-3"><div class="h-1.5 flex-1 overflow-hidden rounded-full bg-white/10"><div class="h-full rounded-full ${utilization >= 70 ? 'bg-rose-400' : utilization >= 30 ? 'bg-amber-300' : 'bg-emerald-400'}" style="width:${utilization}%"></div></div><span class="mono w-10 text-right text-[11px] text-slate-400">${utilization.toFixed(0)}%</span></div></td><td class="py-3 text-right mono text-xs ${need > 0 ? 'text-indigo-200' : 'text-emerald-300'}">${need > 0 ? 'AED ' + formatAED(need) : 'On target'}</td></tr>`;
-                const m = txs.filter(t => (t.date || '').startsWith(ym)), sp = ddSum(m.filter(t => t.type === 'Purchase' || t.type === 'Cash Withdrawal'), t => t.amount), cb = ddSum(m, t => t.cashback);
+                const m = txs.filter(t => (t.date || '').startsWith(ym)), sp = ddSum(m.filter(t => txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'), t => t.amount), cb = ddSum(m, t => t.cashback);
                 const pj = sp / d * dim, pc = cb / d * dim, ms = ddNum(r.minSpend);
                 projectedSpendTotal += pj;
                 projectedCashbackTotal += pc;
@@ -4322,10 +4398,10 @@
                 rc += `<tr class="border-t border-white/5"><td class="py-3 pr-3 font-medium text-slate-200">${escapeHtml(c.name)}</td><td class="py-3 pr-3 mono text-xs text-slate-300">AED ${formatAED(exp)}</td><td class="py-3 pr-3"><label class="sr-only" for="recon-${escapeHtml(c.id)}">Cashback received for ${escapeHtml(c.name)}</label><input id="recon-${escapeHtml(c.id)}" type="number" step="0.01" min="0" value="${got ?? ''}" onchange="ddSaveRecon('${c.id}','${pym}',this.value)" placeholder="Enter amount" class="w-28 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-xs text-slate-100 placeholder:text-slate-600"></td><td class="py-3 text-right mono text-xs ${diff !== null && Math.abs(diff) > .01 ? 'text-rose-300' : 'text-emerald-300'}">${diff === null ? '—' : (diff > 0 ? '+' : '') + formatAED(diff)}</td></tr>`;
                 const yt = txs.filter(t => (t.date || '').startsWith(String(now.getFullYear())));
                 c._yr = ddSum(yt, t => t.cashback);
-                c._ys = ddSum(yt.filter(t => t.type === 'Purchase'), t => t.amount);
+                c._ys = ddSum(yt.filter(t => txKind(t.type) === 'Purchase'), t => t.amount);
             });
             const ranked = [...act].sort((a, b) => b._yr - a._yr);
-            const cats = {}; transactions.filter(t => t.type === 'Purchase' && (t.date || '').startsWith(String(now.getFullYear()))).forEach(t => { const k = t.category || 'Uncategorised'; cats[k] = (cats[k] || 0) + ddNum(t.amount); });
+            const cats = {}; transactions.filter(t => txKind(t.type) === 'Purchase' && (t.date || '').startsWith(String(now.getFullYear()))).forEach(t => { const k = t.category || 'Uncategorised'; cats[k] = (cats[k] || 0) + ddNum(t.amount); });
             const totalCashback = ddSum(act, c => c._yr), totalYearSpend = ddSum(act, c => c._ys);
             const topCategories = Object.entries(cats).sort((a, b) => b[1] - a[1]).slice(0, 5);
             const section = (eyebrow, title, description, content) => `<section class="mt-6 rounded-2xl border border-white/[.07] bg-white/[.02] p-4 sm:p-5">
@@ -4520,6 +4596,10 @@
             document.getElementById('card-rules-section').open = hasAnnualFee || DD_RULE_FIELDS.some(k => r[k]) || Object.keys(caps).length > 0;
         }
         function ddSaveRulesFromForm(id) {
+            if (isDebit(cards.find(c => String(c.id) === String(id)))) { // debit cards: no fees, caps or cashback rules
+                const store = ddLoad('dd-card-rules'); delete store[id]; ddSave('dd-card-rules', store); ddPushRules(id, {});
+                return;
+            }
             const rules = {};
             DD_RULE_FIELDS.forEach(k => { rules[k] = document.getElementById('cr-' + k).value.trim(); });
             const annualFeeApplies = document.getElementById('cr-annual-fee-paid').checked;
@@ -4580,9 +4660,6 @@
             const row = (label, value, sign, cls) => `
                 <div class="flex justify-between"><span class="text-slate-500 dark:text-slate-400">${label}</span>
                 <span class="font-medium ${cls || 'text-slate-700 dark:text-slate-300'}">${sign} ${formatAED(value)}</span></div>`;
-            const pendingLine = ob.cashbackPending > 0 ? `
-                <div class="flex justify-between text-[11px]"><span class="text-slate-400">Balance after pending cashback</span>
-                <span class="mono font-semibold text-emerald-400">AED ${formatAED(balance + ob.cashbackPending)}</span></div>` : '';
             return `
                 <div class="cc ${c.disabled ? 'cc-disabled' : ''} text-xs space-y-5" style="${cardThemeVars(theme)}">
                     ${cardWatermarkHtml(theme)}
@@ -4619,16 +4696,13 @@
                             <div class="mt-2 space-y-1 text-[11px]">
                                 ${row('Opening balance', opening, '')}
                                 ${row('Deposits / top-ups', ob.repaid, '+', 'text-emerald-600')}
-                                ${row('Cashback already credited', ob.cashbackCredited, '+', 'text-emerald-600')}
                                 ${row('Purchases', ob.purchases, '−')}
                                 ${row('Cash withdrawals', ob.withdrawals, '−')}
-                                ${INCLUDE_FEES_IN_OUTSTANDING ? row('Service fees', ob.fees, '−') : ''}
                                 <div class="flex justify-between pt-1 mt-1 border-t border-slate-200 dark:border-slate-600 font-semibold text-slate-800 dark:text-slate-200">
                                     <span>Balance today</span><span>= ${formatAED(balance)}</span>
                                 </div>
                             </div>
                         </details>
-                        ${pendingLine}
                     </div>
                 </div>`;
         }
@@ -4732,7 +4806,7 @@
 
                 const currentMonthSpend = cardTx
                     .filter(t => t.date && t.date.startsWith(currentMonthKey) &&
-                                 (t.type === 'Purchase' || t.type === 'Cash Withdrawal'))
+                                 (txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal'))
                     .reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
 
                 const percentage = targetLimit > 0 ? Math.min(Math.round((currentMonthSpend / targetLimit) * 100), 100) : 0;
@@ -5078,7 +5152,7 @@
             if (col === 'card') return (t.cardName || '').trim().toLowerCase();
             if (col === 'amount') return parseFloat(t.amount) || 0;
             if (col === 'cashback') return parseFloat(t.cashback) || 0;
-            if (col === 'net') return (t.type === 'Repaid') ? 0 : ((parseFloat(t.cashback) || 0) - (parseFloat(t.serviceCharge) || 0));
+            if (col === 'net') return (txKind(t.type) === 'Repaid') ? 0 : ((parseFloat(t.cashback) || 0) - (parseFloat(t.serviceCharge) || 0));
             return '';
         }
 
@@ -5213,9 +5287,9 @@
                 const amount = parseFloat(t.amount) || 0;
                 const cashback = isImmediateCashbackTransaction(t) ? amount : (parseFloat(t.cashback) || 0);
                 const fee = parseFloat(t.serviceCharge) || 0;
-                const netReward = (t.type === 'Repaid') ? 0 : (cashback - fee);
+                const netReward = (txKind(t.type) === 'Repaid') ? 0 : (cashback - fee);
 
-                if (!isImmediateCashbackTransaction(t) && (t.type === 'Purchase' || t.type === 'Cash Withdrawal')) {
+                if (!isImmediateCashbackTransaction(t) && (txKind(t.type) === 'Purchase' || txKind(t.type) === 'Cash Withdrawal')) {
                     totalSpend += amount;
 
                     // "Left on the table": what the best available card's rate would have
@@ -5246,9 +5320,9 @@
                     monthlyData[monthKey] = { purchase: 0, withdrawal: 0, repaid: 0, fee: 0, cashback: 0, netReward: 0 };
                 }
 
-                if (t.type === 'Purchase') monthlyData[monthKey].purchase += amount;
-                if (t.type === 'Cash Withdrawal') monthlyData[monthKey].withdrawal += amount;
-                if (t.type === 'Repaid') monthlyData[monthKey].repaid += amount;
+                if (txKind(t.type) === 'Purchase') monthlyData[monthKey].purchase += amount;
+                if (txKind(t.type) === 'Cash Withdrawal') monthlyData[monthKey].withdrawal += amount;
+                if (txKind(t.type) === 'Repaid') monthlyData[monthKey].repaid += amount;
                 monthlyData[monthKey].fee += fee;
                 monthlyData[monthKey].cashback += cashback;
                 monthlyData[monthKey].netReward += netReward;
@@ -5279,7 +5353,7 @@
                     const amount = parseFloat(t.amount) || 0;
                     const cashback = isImmediateCashbackTransaction(t) ? amount : (parseFloat(t.cashback) || 0);
                     const fee = parseFloat(t.serviceCharge) || 0;
-                    const isRepaid = t.type === 'Repaid';
+                    const isRepaid = txKind(t.type) === 'Repaid';
                     const netReward = isRepaid ? 0 : (cashback - fee);
                     // Net Rewards = cashback − service fee (an amount, not a percentage)
                     const netCls = isRepaid ? 'muted' : netReward < 0 ? 'neg' : netReward === 0 ? 'muted' : 'pos';
@@ -5351,15 +5425,15 @@
                 const fee = parseFloat(transaction.serviceCharge) || 0;
                 const monthKey = transaction.date.substring(0, 7);
                 if (!monthlyData[monthKey]) monthlyData[monthKey] = { purchase: 0, withdrawal: 0, repaid: 0, fee: 0, cashback: 0, netReward: 0 };
-                if (transaction.type === 'Purchase') {
+                if (txKind(transaction.type) === 'Purchase') {
                     monthlyData[monthKey].purchase += amount;
                     totalSpend += amount;
                 }
-                if (transaction.type === 'Cash Withdrawal') {
+                if (txKind(transaction.type) === 'Cash Withdrawal') {
                     monthlyData[monthKey].withdrawal += amount;
                     totalSpend += amount;
                 }
-                if (transaction.type === 'Repaid') monthlyData[monthKey].repaid += amount;
+                if (txKind(transaction.type) === 'Repaid') monthlyData[monthKey].repaid += amount;
                 monthlyData[monthKey].fee += fee;
                 monthlyData[monthKey].cashback += cashback;
                 monthlyData[monthKey].netReward += cashback - fee;
@@ -5632,11 +5706,11 @@
                     const amount = parseFloat(t.amount) || 0;
                     const cashback = isImmediateCashbackTransaction(t) ? amount : (parseFloat(t.cashback) || 0);
                     const fee = parseFloat(t.serviceCharge) || 0;
-                    const netReward = (t.type === 'Repaid') ? 0 : (cashback - fee);
+                    const netReward = (txKind(t.type) === 'Repaid') ? 0 : (cashback - fee);
 
-                    if (!isImmediateCashbackTransaction(t) && t.type === 'Purchase') cardAgg[cName].purchase += amount;
-                    if (!isImmediateCashbackTransaction(t) && t.type === 'Cash Withdrawal') cardAgg[cName].withdrawal += amount;
-                    if (t.type === 'Repaid') cardAgg[cName].repaid += amount;
+                    if (!isImmediateCashbackTransaction(t) && txKind(t.type) === 'Purchase') cardAgg[cName].purchase += amount;
+                    if (!isImmediateCashbackTransaction(t) && txKind(t.type) === 'Cash Withdrawal') cardAgg[cName].withdrawal += amount;
+                    if (txKind(t.type) === 'Repaid') cardAgg[cName].repaid += amount;
                     cardAgg[cName].fee += fee;
                     cardAgg[cName].cashback += cashback;
                     if (isCashbackCredited(t, summaryCurrentDate)) cardAgg[cName].cashbackCredited += cashback;
@@ -5683,11 +5757,11 @@
                     const amount = parseFloat(t.amount) || 0;
                     const cashback = isImmediateCashbackTransaction(t) ? amount : (parseFloat(t.cashback) || 0);
                     const fee = parseFloat(t.serviceCharge) || 0;
-                    const netReward = (t.type === 'Repaid') ? 0 : (cashback - fee);
+                    const netReward = (txKind(t.type) === 'Repaid') ? 0 : (cashback - fee);
 
-                    if (!isImmediateCashbackTransaction(t) && t.type === 'Purchase') catAgg[catName].purchase += amount;
-                    if (!isImmediateCashbackTransaction(t) && t.type === 'Cash Withdrawal') catAgg[catName].withdrawal += amount;
-                    if (t.type === 'Repaid') catAgg[catName].repaid += amount;
+                    if (!isImmediateCashbackTransaction(t) && txKind(t.type) === 'Purchase') catAgg[catName].purchase += amount;
+                    if (!isImmediateCashbackTransaction(t) && txKind(t.type) === 'Cash Withdrawal') catAgg[catName].withdrawal += amount;
+                    if (txKind(t.type) === 'Repaid') catAgg[catName].repaid += amount;
                     catAgg[catName].fee += fee;
                     catAgg[catName].cashback += cashback;
                     if (isCashbackCredited(t, summaryCurrentDate)) catAgg[catName].cashbackCredited += cashback;

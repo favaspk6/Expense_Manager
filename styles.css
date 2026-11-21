@@ -1978,3 +1978,18 @@
             #sp-modal .sp-inbox-item { transition: none; }
             #sp-modal .sp-inbox-item:hover { transform: none; }
         }
+
+/* Radio buttons inside the settings window (e.g. "Feels like"): the generic text-input rules above
+   (46px min-height, glow ring) made them stretch into a tall oval, so reset them to normal radios. */
+#settings-modal input[type="radio"],
+html.dark #settings-modal input[type="radio"] {
+    min-height: 0 !important;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+#settings-modal input[type="radio"]:focus,
+html.dark #settings-modal input[type="radio"]:focus { box-shadow: none !important; }
+#settings-modal input[type="radio"]:focus-visible { outline: 2px solid rgba(99, 102, 241, .55); outline-offset: 2px; }
