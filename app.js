@@ -56,11 +56,12 @@
             try { localStorage.setItem('cb_debit_cards', JSON.stringify(cards.filter(isDebit).map(c => String(c.id)))); } catch (e) { /* private mode */ }
         }
         function debitBalance(c, asOf, ignoreTxId) {
-            const list = cardTxList(c).filter(t => !ignoreTxId || t.id !== ignoreTxId);
+            const ignoredIds = new Set((Array.isArray(ignoreTxId) ? ignoreTxId : [ignoreTxId])
+                .filter(id => id !== undefined && id !== null && id !== '')
+                .map(String));
+            const list = cardTxList(c).filter(t => !ignoredIds.has(String(t.id)));
             return (Number(c.availableLimit) || 0) - calculateOutstanding(list, asOf || localDateKey(), c).outstanding;
         }
-        // Cards that behave like credit cards (limit, statement/payment dates, outstanding).
-        const activeCreditCards = () => activeCards().filter(c => !isDebit(c));
         // Card names that should appear in the card filters (chips + history dropdown).
         function filterableCardNames() {
             const off = disabledCardNames();
@@ -107,8 +108,12 @@
         let selectedCategories = []; // empty array = "All Categories"; otherwise one or more category names
         let selectedMonths = []; // empty array = "All Months"; otherwise one or more 'YYYY-MM' keys, e.g. last 2 months
         let searchQuery = '';
-        const TYPE_FILTER_OPTIONS = ['Purchase', 'Cash Withdrawal', 'Repaid', 'Cashback']; // same list as the Type dropdown in the transaction form
+        const TRANSFER_OUT_TYPE = 'Transfer Out';
+        const TRANSFER_IN_TYPE = 'Transfer In';
+        const TRANSFER_NOTE_PREFIX = 'Transfer group: ';
+        const TYPE_FILTER_OPTIONS = ['Purchase', 'Cash Withdrawal', 'Repaid', 'Cashback', TRANSFER_OUT_TYPE, TRANSFER_IN_TYPE];
         let activeTypeFilter = 'ALL'; // 'ALL' or one of TYPE_FILTER_OPTIONS
+        let transactionEntryKind = '';
         let financialPeriod = 'month';
         let currentReportTransactions = [];
         const customTransactionTypes = [];
@@ -122,6 +127,11 @@
             return TX_KINDS.includes(k) ? k : null;
         }
         const isSpendKind = type => { const k = txKind(type); return k === 'Purchase' || k === 'Cash Withdrawal'; };
+        const transferGroupId = transaction => {
+            const match = String(transaction && transaction.notes || '').match(/(?:^|\n)Transfer group: ([^\r\n]+)/);
+            return match ? match[1] : '';
+        };
+        const isTransferType = type => type === TRANSFER_OUT_TYPE || type === TRANSFER_IN_TYPE;
         function persistTypeBehaviors() {
             try { localStorage.setItem('cb_custom_type_behaviors', JSON.stringify(customTypeBehavior)); } catch (e) { /* private mode */ }
         }
@@ -700,8 +710,16 @@
 
             const label = ids.length === 1 ? 'Transaction will be deleted in 5 seconds' : `${ids.length} transactions will be deleted in 5 seconds`;
             const timer = setTimeout(async () => {
+                const deleted = ids.length > 1
+                    ? await deleteTransactionsFromDB(ids)
+                    : await deleteTransactionFromDB(ids[0]);
+                if (deleted === false) {
+                    ids.forEach(id => hiddenTxIds.delete(id));
+                    ids.forEach(id => pendingDeleteTimers.delete(id));
+                    render();
+                    return;
+                }
                 for (const id of ids) {
-                    await deleteTransactionFromDB(id);
                     hiddenTxIds.delete(id);
                     pendingDeleteTimers.delete(id);
                 }
@@ -758,7 +776,7 @@
             return !!creditDate && creditDate <= asOfDate;
         }
         function calculateOutstanding(txList, asOfDate = localDateKey(), card = null) {
-            const r = { purchases: 0, withdrawals: 0, fees: 0, repaid: 0, cashbackCredited: 0, cashbackPending: 0, cashbackPendingByDate: {} };
+            const r = { purchases: 0, withdrawals: 0, fees: 0, repaid: 0, transferOut: 0, transferIn: 0, cashbackCredited: 0, cashbackPending: 0, cashbackPendingByDate: {} };
 
             txList.forEach(t => {
                 const date = t.date || '';
@@ -772,6 +790,8 @@
                 if (!immediateCashback && txKind(t.type) === 'Purchase') r.purchases += amount;
                 else if (!immediateCashback && txKind(t.type) === 'Cash Withdrawal') r.withdrawals += amount;
                 else if (!immediateCashback && txKind(t.type) === 'Repaid') r.repaid += amount;
+                else if (t.type === TRANSFER_OUT_TYPE) r.transferOut += amount;
+                else if (t.type === TRANSFER_IN_TYPE) r.transferIn += amount;
                 r.fees += fee;
 
                 if (immediateCashback) {
@@ -788,8 +808,8 @@
                 }
             });
 
-            r.outstanding = r.purchases + r.withdrawals + (INCLUDE_FEES_IN_OUTSTANDING ? r.fees : 0)
-                          - r.repaid - r.cashbackCredited;
+            r.outstanding = r.purchases + r.withdrawals + r.transferOut + (INCLUDE_FEES_IN_OUTSTANDING ? r.fees : 0)
+                          - r.repaid - r.transferIn - r.cashbackCredited;
             r.afterPending = r.outstanding - r.cashbackPending;
             return r;
         }
@@ -1075,20 +1095,126 @@
                 RATE_CATEGORIES.map(cat => `<option value="${cat}">${cat}</option>`).join('');
             renderRecommendationCategoryPills();
 
-            document.getElementById('exp-category').innerHTML =
-                `<option value="">None / Default</option>` +
-                RATE_CATEGORIES.map(cat => `<option value="${cat}">${cat}</option>`).join('') +
-                TX_ONLY_CATEGORIES.map(cat => `<option value="${cat}">${cat}</option>`).join('') +
-                '<option value="__add_new_category__">+ Add new category...</option>';
+            populateTransactionCategorySelect();
+        }
+
+        function populateTransactionCategorySelect(preferredCategory) {
+            const select = document.getElementById('exp-category');
+            if (!select) return;
+            const previousValue = preferredCategory !== undefined
+                ? preferredCategory
+                : (select.value || select.dataset.previousValue || '');
+            const options = ['<option value="">None / Default</option>'];
+            RATE_CATEGORIES.forEach(category => {
+                options.push(`<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`);
+            });
+            TX_ONLY_CATEGORIES.forEach(category => {
+                options.push(`<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`);
+            });
+            options.push('<option value="__add_new_category__">+ Add new category...</option>');
+            select.innerHTML = options.join('');
+            if (previousValue && [...select.options].some(option => option.value === previousValue)) {
+                select.value = previousValue;
+            } else {
+                select.value = '';
+            }
+            select.dataset.previousValue = select.value;
         }
 
         function populateTransactionTypes() {
             const select = document.getElementById('exp-type');
             if (!select) return;
             const selected = select.value;
-            select.innerHTML = TYPE_FILTER_OPTIONS.map(type => `<option value="${type}">${type}</option>`).join('') +
-                '<option value="__add_new_type__">+ Add new type...</option>';
-            if (TYPE_FILTER_OPTIONS.includes(selected)) select.value = selected;
+            const types = transactionEntryKind === 'income'
+                ? TYPE_FILTER_OPTIONS.filter(type => ['Repaid', 'Cashback'].includes(txKind(type)))
+                : transactionEntryKind === 'expense'
+                    ? TYPE_FILTER_OPTIONS.filter(type => !isTransferType(type) && (isSpendKind(type) || !txKind(type)))
+                    : [];
+            const hasTransactionType = ['income', 'expense'].includes(transactionEntryKind);
+            select.innerHTML = hasTransactionType
+                ? `<option value="">Select type...</option>${types.map(type => `<option value="${escapeHtml(type)}">${escapeHtml(type)}</option>`).join('')}<option value="__add_new_type__">+ Add new type...</option>`
+                : '<option value="">Choose transaction kind first</option>';
+            select.disabled = !hasTransactionType;
+            select.required = hasTransactionType;
+            if (types.some(type => type === selected)) select.value = selected;
+            else select.value = transactionEntryKind === 'income' ? 'Repaid' : transactionEntryKind === 'expense' ? 'Purchase' : '';
+        }
+
+        function groupedCardOptions(cardList) {
+            return ['Debit', 'Credit'].map(type => {
+                const group = cardList.filter(card => (isDebit(card) ? 'Debit' : 'Credit') === type);
+                return group.length
+                    ? `<optgroup label="${type}">${group.map(card => `<option value="${escapeHtml(card.id)}">${escapeHtml(card.name)}</option>`).join('')}</optgroup>`
+                    : '';
+            }).join('');
+        }
+
+        function populateTransferCardSelects(sourceId = '', destinationId = '', allowInactive = false) {
+            const sourceSelect = document.getElementById('exp-transfer-source');
+            const destinationSelect = document.getElementById('exp-transfer-destination');
+            if (!sourceSelect || !destinationSelect) return;
+            const sourceCards = activeCards();
+            const destinationCards = activeCards();
+            [sourceId, destinationId].forEach((id, index) => {
+                if (!id) return;
+                const card = cards.find(c => String(c.id) === String(id));
+                const list = index === 0 ? sourceCards : destinationCards;
+                if (card && !list.some(c => String(c.id) === String(card.id)) && allowInactive) list.push(card);
+            });
+            sourceSelect.innerHTML = `<option value="">Select source card...</option>${groupedCardOptions(sourceCards)}`;
+            sourceSelect.disabled = sourceCards.length === 0;
+            const availableDestinations = destinationCards.filter(card => String(card.id) !== String(sourceId));
+            destinationSelect.innerHTML = `<option value="">Select destination card...</option>${groupedCardOptions(availableDestinations)}`;
+            destinationSelect.disabled = availableDestinations.length === 0;
+            sourceSelect.required = transactionEntryKind === 'transfer';
+            destinationSelect.required = transactionEntryKind === 'transfer';
+            sourceSelect.value = sourceCards.some(card => String(card.id) === String(sourceId)) ? String(sourceId) : '';
+            destinationSelect.value = availableDestinations.some(card => String(card.id) === String(destinationId)) ? String(destinationId) : '';
+        }
+
+        function setTransactionEntryKind(kind) {
+            transactionEntryKind = ['income', 'expense', 'transfer'].includes(kind) ? kind : '';
+            const isTransfer = transactionEntryKind === 'transfer';
+            const isEntry = transactionEntryKind === 'income' || transactionEntryKind === 'expense';
+            if (!document.getElementById('editing-tx-id').value) {
+                document.getElementById('tx-submit-btn').textContent = isTransfer ? 'Log Transfer' : 'Log Entry';
+            }
+            document.querySelectorAll('input[name="entry-kind"]').forEach(input => {
+                input.checked = input.value === transactionEntryKind;
+            });
+            document.getElementById('exp-date-type-row').classList.toggle('grid-cols-1', isTransfer);
+            document.getElementById('exp-date-type-row').classList.toggle('grid-cols-2', !isTransfer);
+            document.getElementById('exp-type-wrapper').classList.toggle('hidden', isTransfer);
+            document.getElementById('exp-card-wrapper').classList.toggle('hidden', isTransfer);
+            document.getElementById('exp-transfer-cards').classList.toggle('hidden', !isTransfer);
+            document.getElementById('exp-card').required = isEntry;
+            document.getElementById('exp-category-wrapper').classList.toggle('hidden', isTransfer);
+            document.getElementById('exp-amount-category-row').classList.toggle('grid-cols-1', isTransfer);
+            document.getElementById('exp-amount-category-row').classList.toggle('grid-cols-2', !isTransfer);
+            document.getElementById('exp-fee-cashback-row').classList.toggle('hidden', isTransfer);
+            document.getElementById('exp-emi-wrapper').classList.toggle('hidden', isTransfer);
+            if (isTransfer) {
+                document.getElementById('exp-service').value = '0';
+                document.getElementById('exp-cashback').value = '0';
+                document.getElementById('exp-is-emi').checked = false;
+                document.getElementById('exp-emi-details').classList.add('hidden');
+            }
+            populateTransactionTypes();
+            const selectedType = document.getElementById('exp-type').value;
+            if (isEntry && selectedType) syncCategoryState(selectedType);
+            if (isTransfer) {
+                populateTransferCardSelects(
+                    document.getElementById('exp-transfer-source').value,
+                    document.getElementById('exp-transfer-destination').value,
+                    !!document.getElementById('editing-tx-id').value
+                );
+            }
+            syncRepaidLabel();
+        }
+
+        function entryKindForType(type) {
+            if (isTransferType(type)) return 'transfer';
+            return ['Repaid', 'Cashback'].includes(txKind(type)) ? 'income' : 'expense';
         }
 
         // Merge a list of saved types/categories into the live in-memory lists.
@@ -1159,6 +1285,19 @@
             localStorage.setItem('cb_custom_transaction_types', JSON.stringify(customTransactionTypes));
             localStorage.setItem('cb_custom_categories', JSON.stringify(customCategories));
             if (!_supabase || !currentUserId) return true;
+            // Check exact names case-insensitively before inserting, without treating % or _
+            // in a category name as SQL wildcard characters.
+            try {
+                const existing = await _supabase
+                    .from('shared_options')
+                    .select('id, name')
+                    .eq('kind', kind);
+                if (!existing.error && existing.data && existing.data.some(option =>
+                    String(option.name || '').trim().toLowerCase() === name.trim().toLowerCase()
+                )) return true;
+            } catch (error) {
+                console.warn('Could not check existing shared option:', error);
+            }
             const row = { kind, name, created_by: currentUserId };
             if (kind === 'transaction_type' && behavesLike) row.behaves_like = behavesLike;
             let { error } = await _supabase.from('shared_options').insert(row);
@@ -1182,6 +1321,52 @@
                 return false;
             }
             return true;
+        }
+
+        async function syncUsedSharedOptions(categories, types) {
+            const categoryNames = [...new Set((categories || []).map(name => String(name || '').trim()).filter(Boolean))];
+            const typeNames = [...new Set((types || []).map(name => String(name || '').trim()).filter(Boolean))];
+            const existingCategories = new Map([...RATE_CATEGORIES, ...TX_ONLY_CATEGORIES].map(name => [name.toLowerCase(), name]));
+            const existingTypes = new Map(TYPE_FILTER_OPTIONS.map(name => [name.toLowerCase(), name]));
+            const newCategories = [];
+            const newTypes = [];
+
+            categoryNames.forEach(name => {
+                const key = name.toLowerCase();
+                if (!existingCategories.has(key)) {
+                    existingCategories.set(key, name);
+                    newCategories.push(name);
+                }
+            });
+            typeNames.forEach(name => {
+                const key = name.toLowerCase();
+                if (!existingTypes.has(key)) {
+                    existingTypes.set(key, name);
+                    newTypes.push(name);
+                }
+            });
+
+            if (newCategories.length || newTypes.length) applyCustomSettings(newTypes, newCategories);
+
+            let failures = 0;
+            for (const name of categoryNames) {
+                try {
+                    if ((await saveSharedOption('category', name)) === false) failures++;
+                } catch (error) {
+                    console.error(`Could not sync category "${name}" to shared_options:`, error);
+                    failures++;
+                }
+            }
+            for (const name of typeNames) {
+                try {
+                    if ((await saveSharedOption('transaction_type', name)) === false) failures++;
+                } catch (error) {
+                    console.error(`Could not sync transaction type "${name}" to shared_options:`, error);
+                    failures++;
+                }
+            }
+            if (newCategories.length || newTypes.length) refreshOptionUI();
+            return { categories: newCategories.length, types: newTypes.length, failures };
         }
 
         // Live updates: when any user adds an option, everyone else gets it without a refresh.
@@ -1228,7 +1413,7 @@
 
         async function openTransactionSettings(kind) {
             const select = document.getElementById(kind === 'type' ? 'exp-type' : 'exp-category');
-            const defaultValue = kind === 'type' ? 'Purchase' : '';
+            const defaultValue = kind === 'type' ? (transactionEntryKind === 'income' ? 'Repaid' : 'Purchase') : '';
             transactionSettingsReturn = { kind, previousValue: select.dataset.previousValue || defaultValue };
             document.getElementById('tx-modal').classList.add('hidden');
             await openSettings();
@@ -1240,6 +1425,9 @@
             document.getElementById('settings-modal').classList.add('hidden');
             document.getElementById('tx-modal').classList.remove('hidden');
             const select = document.getElementById(kind === 'type' ? 'exp-type' : 'exp-category');
+            if (kind === 'type' && transactionEntryKind !== entryKindForType(value)) {
+                setTransactionEntryKind(entryKindForType(value));
+            }
             select.value = value;
             select.dataset.previousValue = value;
             if (kind === 'type') syncCategoryState(value);
@@ -1454,7 +1642,10 @@
                 }
             }
         }
-        ['exp-card'].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', syncRepaidLabel); });
+        ['exp-card'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', syncRepaidLabel);
+        });
         ['mousedown', 'touchstart', 'focus'].forEach(ev => { const el = document.getElementById('exp-type'); if (el) el.addEventListener(ev, syncRepaidLabel); });
 
         function openCardModal() {
@@ -2010,6 +2201,13 @@
                 transactions = JSON.parse(localStorage.getItem('cb_transactions')) || [];
             }
             await loadCustomSettings();
+            const optionSync = await syncUsedSharedOptions(
+                transactions.map(transaction => transaction.category),
+                transactions.map(transaction => transaction.type)
+            );
+            if (_supabase && currentUserId && optionSync.failures > 0) {
+                showToast(`${optionSync.failures} category/type option(s) from saved transactions could not be synced to Supabase.`, { tone: 'error', duration: 10000 });
+            }
             subscribeSharedOptions();
             populateTransactionTypes();
             renderTypeFilter();
@@ -2255,11 +2453,27 @@
                 if (error) {
                     console.error('Deleting transaction failed:', error);
                     showToast(`Delete failed on Supabase: ${error.message}`, { tone: 'error', duration: 10000 });
-                    return;
+                    return false;
                 }
             }
             transactions = transactions.filter(t => t.id !== String(id));
             saveData();
+            return true;
+        }
+
+        async function deleteTransactionsFromDB(ids) {
+            const idSet = new Set(ids.map(String));
+            if (_supabase) {
+                const { error } = await _supabase.from('transactions').delete().in('id', [...idSet]);
+                if (error) {
+                    console.error('Deleting transactions failed:', error);
+                    showToast(`Delete failed on Supabase: ${error.message}`, { tone: 'error', duration: 10000 });
+                    return false;
+                }
+            }
+            transactions = transactions.filter(tx => !idSet.has(String(tx.id)));
+            saveData();
+            return true;
         }
 
         function calculateDynamicCashback() {
@@ -2321,6 +2535,16 @@
             }
         }
 
+        document.querySelectorAll('input[name="entry-kind"]').forEach(input => {
+            input.addEventListener('change', event => setTransactionEntryKind(event.target.value));
+        });
+        document.getElementById('exp-transfer-source').addEventListener('change', () => {
+            populateTransferCardSelects(
+                document.getElementById('exp-transfer-source').value,
+                document.getElementById('exp-transfer-destination').value,
+                !!document.getElementById('editing-tx-id').value
+            );
+        });
         ['exp-amount', 'exp-category', 'exp-card', 'exp-date'].forEach(id => {
             document.getElementById(id).addEventListener('input', calculateDynamicCashback);
             document.getElementById(id).addEventListener('change', calculateDynamicCashback);
@@ -2336,6 +2560,7 @@
             }
             event.target.dataset.previousValue = event.target.value;
             if (event.target.value === 'Cashback' && document.getElementById('exp-type').value !== 'Cashback') {
+                if (transactionEntryKind !== 'income') setTransactionEntryKind('income');
                 document.getElementById('exp-type').value = 'Cashback';
                 syncCategoryState('Cashback');
             }
@@ -2357,27 +2582,23 @@
                 dateField.value = new Date().toISOString().slice(0, 10);
             }
 
-            // For a genuinely new entry (not editing/duplicating, which already set their own
-            // values), start from whatever card & type were used last time to cut repeat typing.
+            // For a genuinely new entry (not editing/duplicating), preselect the last-used card.
             if (prefillLast) {
                 try {
                     const lastCardId = localStorage.getItem('lastUsedCardId');
-                    const lastType = localStorage.getItem('lastUsedType');
                     const cardSelect = document.getElementById('exp-card');
                     // the card chosen with "Set as Default" wins; otherwise the last-used card
                     const preferredCardId = [getDefaultCardId(), lastCardId].find(id => id && [...cardSelect.options].some(o => o.value === id));
                     if (preferredCardId) {
                         cardSelect.value = preferredCardId;
                     }
-                    if (lastType) {
-                        const typeSelect = document.getElementById('exp-type');
-                        typeSelect.value = lastType;
-                        syncCategoryState(lastType);
-                    }
                 } catch (err) { /* localStorage may be unavailable (e.g. private mode) — safe to skip */ }
             }
 
+            populateTransactionCategorySelect();
+            setTransactionEntryKind(transactionEntryKind);
             syncRepaidLabel();
+            calculateDynamicCashback();
             // Description is the next thing that needs typing (date/type/card already have
             // sensible defaults), so put the cursor there.
             setTimeout(() => document.getElementById('exp-desc').focus(), 50);
@@ -2390,7 +2611,9 @@
 
         function cancelEditTransaction() {
             document.getElementById('editing-tx-id').value = "";
+            document.getElementById('editing-transfer-peer-id').value = "";
             document.getElementById('expense-form').reset();
+            setTransactionEntryKind('');
             document.getElementById('exp-form-title').innerHTML = `<span>➕</span> Log New Transaction`;
             document.getElementById('tx-form-subtitle').textContent = 'Record a purchase, payment, or reward';
             document.getElementById('tx-submit-btn').textContent = "Log Entry";
@@ -2398,6 +2621,7 @@
             document.getElementById('exp-emi-custom-wrapper').classList.add('hidden');
             document.getElementById('exp-emi-charge-input-wrapper').classList.add('hidden');
             document.getElementById('exp-emi-preview').textContent = '';
+            populateTransactionCategorySelect('');
             syncCategoryState(document.getElementById('exp-type').value);
         }
 
@@ -2717,6 +2941,7 @@
                 const categoryLookup = new Map([...RATE_CATEGORIES, ...TX_ONLY_CATEGORIES].map(c => [c.toLowerCase(), c]));
                 const typeLookup = new Map(TYPE_FILTER_OPTIONS.map(t => [t.toLowerCase(), t]));
                 const newCategories = [], newTypes = []; // brand-new names found in this file
+                const usedCategories = [], usedTypes = [];
                 let imported = 0, skipped = 0, dbFailed = 0;
 
                 for (let i = 0; i < rawData.length; i++) {
@@ -2752,6 +2977,8 @@
                             categoryLookup.set(category.toLowerCase(), category);
                             newCategories.push(category);
                         }
+                        if (category) usedCategories.push(category);
+                        usedTypes.push(type);
 
                         let rowFailed = false;
                         let matchedCard = cards.find(c => c.name.trim().toLowerCase() === cardName.toLowerCase());
@@ -2781,19 +3008,15 @@
                     }
                 }
 
-                // Create the new categories / types: in-memory lists + dropdowns + Supabase shared_options.
-                let optionsFailed = 0;
-                if (newCategories.length || newTypes.length) {
-                    applyCustomSettings(newTypes, newCategories);
-                    for (const name of newCategories) if ((await saveSharedOption('category', name)) === false) optionsFailed++;
-                    for (const name of newTypes) if ((await saveSharedOption('transaction_type', name)) === false) optionsFailed++;
-                    refreshOptionUI();
-                }
+                // Sync every category/type used by imported rows to shared_options.
+                // Existing names are matched case-insensitively, so they are not inserted again.
+                const syncResult = await syncUsedSharedOptions(usedCategories, usedTypes);
+                const optionsFailed = syncResult.failures;
 
                 let summary = `Imported ${imported} of ${rawData.length} rows.`;
                 if (newCategories.length) summary += `\nAdded ${newCategories.length} new categor${newCategories.length === 1 ? 'y' : 'ies'}: ${newCategories.join(', ')}.`;
                 if (newTypes.length) summary += `\nAdded ${newTypes.length} new type${newTypes.length === 1 ? '' : 's'}: ${newTypes.join(', ')}.`;
-                if (optionsFailed > 0) summary += `\n${optionsFailed} new categor${optionsFailed === 1 ? 'y/type was' : 'ies/types were'} saved on this device only (shared_options table missing or blocked in Supabase).`;
+                if (optionsFailed > 0) summary += `\n${optionsFailed} imported categor${optionsFailed === 1 ? 'y/type could' : 'ies/types could'} not be saved to Supabase and remain available on this device only.`;
                 if (dbFailed > 0) summary += `\n${dbFailed} row(s) parsed fine but failed to save to Supabase — see the error above.`;
                 if (skipped > 0) summary += `\n${skipped} row(s) skipped — missing a Card name or a valid Amount.`;
                 showToast(summary, { tone: (dbFailed > 0 || optionsFailed > 0) ? 'error' : 'success', duration: (dbFailed > 0 || optionsFailed > 0) ? 10000 : 6000 });
@@ -2965,8 +3188,138 @@
             document.getElementById('card-modal').classList.add('hidden');
         }
 
+        async function saveTransferFromForm() {
+            const sourceId = document.getElementById('exp-transfer-source').value;
+            const destinationId = document.getElementById('exp-transfer-destination').value;
+            const sourceCard = cards.find(card => String(card.id) === sourceId);
+            const destinationCard = cards.find(card => String(card.id) === destinationId);
+            const amount = Number(document.getElementById('exp-amount').value);
+            const editingOutId = document.getElementById('editing-tx-id').value;
+            const editingInId = document.getElementById('editing-transfer-peer-id').value;
+            const allowInactive = !!editingOutId && !!editingInId;
+            if (!sourceCard || !destinationCard || sourceId === destinationId ||
+                (!allowInactive && (!activeCards().includes(sourceCard) || !activeCards().includes(destinationCard)))) {
+                showToast('Choose two different active cards for the transfer.', { tone: 'error' });
+                return;
+            }
+            if (!Number.isFinite(amount) || amount <= 0) {
+                showToast('Enter a transfer amount above 0.', { tone: 'error' });
+                return;
+            }
+
+            const previousOut = editingOutId ? transactions.find(tx => tx.id === editingOutId) : null;
+            const previousIn = editingInId ? transactions.find(tx => tx.id === editingInId) : null;
+            if ((editingOutId && (!previousOut || !previousIn)) ||
+                (previousOut && previousOut.type !== TRANSFER_OUT_TYPE) ||
+                (previousIn && previousIn.type !== TRANSFER_IN_TYPE)) {
+                showToast('This transfer is incomplete and cannot be edited safely.', { tone: 'error' });
+                return;
+            }
+
+            const balance = debitBalance(sourceCard, localDateKey(), [editingOutId, editingInId]);
+            if (amount > balance + 0.005) {
+                const proceed = await showConfirm(
+                    'Not enough balance',
+                    `${sourceCard.name} has AED ${formatAED(balance)} ${isDebit(sourceCard) ? 'available in its balance' : 'available credit'} but this transfer needs AED ${formatAED(amount)}. Save it anyway?`,
+                    { confirmLabel: 'Save anyway' }
+                );
+                if (!proceed) return;
+            }
+
+            const groupId = transferGroupId(previousOut || previousIn) || newId();
+            const description = document.getElementById('exp-desc').value.trim();
+            const date = document.getElementById('exp-date').value;
+            const outTx = {
+                id: editingOutId || newId(),
+                date,
+                cardName: sourceCard.name,
+                cardId: sourceCard.id,
+                type: TRANSFER_OUT_TYPE,
+                desc: description,
+                category: '',
+                amount,
+                serviceCharge: 0,
+                cashback: 0,
+                notes: `${TRANSFER_NOTE_PREFIX}${groupId}`
+            };
+            const inTx = {
+                id: editingInId || newId(),
+                date,
+                cardName: destinationCard.name,
+                cardId: destinationCard.id,
+                type: TRANSFER_IN_TYPE,
+                desc: description,
+                category: '',
+                amount,
+                serviceCharge: 0,
+                cashback: 0,
+                notes: `${TRANSFER_NOTE_PREFIX}${groupId}`
+            };
+
+            const outIndex = previousOut ? transactions.indexOf(previousOut) : -1;
+            const inIndex = previousIn ? transactions.indexOf(previousIn) : -1;
+            if (previousOut) transactions[outIndex] = outTx;
+            if (previousIn) transactions[inIndex] = inTx;
+            if (!previousOut && !previousIn) transactions.unshift(outTx, inTx);
+            else if (!previousOut) transactions.unshift(outTx);
+            else if (!previousIn) transactions.unshift(inTx);
+
+            const submitBtn = document.getElementById('tx-submit-btn');
+            const originalLabel = submitBtn.textContent;
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Saving transfer…';
+            let outSaved = false;
+            let inSaved = false;
+            try {
+                outSaved = await saveTransactionToDB(outTx);
+                if (outSaved === false) throw new Error('The source-card side could not be saved.');
+                inSaved = await saveTransactionToDB(inTx);
+                if (inSaved === false) throw new Error('The destination-card side could not be saved.');
+                try { localStorage.setItem('lastUsedCardId', String(sourceCard.id)); } catch (error) { /* private mode */ }
+                showToast(previousOut ? 'Transfer updated.' : 'Transfer logged on both cards.', { tone: 'success' });
+                closeTxModal();
+            } catch (error) {
+                console.error('Saving paired transfer failed:', error);
+                if (previousOut && previousIn) {
+                    transactions[outIndex] = previousOut;
+                    transactions[inIndex] = previousIn;
+                    if (outSaved || inSaved) {
+                        try {
+                            const restoredOut = await saveTransactionToDB(previousOut);
+                            const restoredIn = await saveTransactionToDB(previousIn);
+                            if (restoredOut === false || restoredIn === false) {
+                                showToast('Could not fully restore the previous transfer; check both cards in transaction history.', { tone: 'error', duration: 10000 });
+                            }
+                        } catch (rollbackError) {
+                            console.error('Restoring previous transfer failed:', rollbackError);
+                            showToast('Could not fully restore the previous transfer; check both cards in transaction history.', { tone: 'error', duration: 10000 });
+                        }
+                    }
+                } else {
+                    transactions = transactions.filter(tx => tx.id !== outTx.id && tx.id !== inTx.id);
+                    let rollbackFailed = false;
+                    if (outSaved && await deleteTransactionFromDB(outTx.id) === false) rollbackFailed = true;
+                    if (inSaved && await deleteTransactionFromDB(inTx.id) === false) rollbackFailed = true;
+                    if (rollbackFailed) showToast('The transfer could not be fully rolled back; check both cards in transaction history.', { tone: 'error', duration: 10000 });
+                    render();
+                }
+                showToast(`Transfer was not fully saved: ${error.message || error}`, { tone: 'error', duration: 10000 });
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = originalLabel;
+            }
+        }
+
         document.getElementById('expense-form').addEventListener('submit', async (e) => {
             e.preventDefault();
+            if (transactionEntryKind === 'transfer') {
+                await saveTransferFromForm();
+                return;
+            }
+            if (!['income', 'expense'].includes(transactionEntryKind)) {
+                showToast('Choose Income, Expense, or Transfer before logging.', { tone: 'error' });
+                return;
+            }
             const editingTxId = document.getElementById('editing-tx-id').value;
             const date = document.getElementById('exp-date').value;
             const type = document.getElementById('exp-type').value;
@@ -3098,10 +3451,9 @@
                 }
             }
 
-            // Remember the last-used card & type so the next new entry starts prefilled with them.
+            // Remember the last-used card; transaction kind must be chosen for each new entry.
             try {
                 localStorage.setItem('lastUsedCardId', txObj.cardId || '');
-                localStorage.setItem('lastUsedType', txObj.type || '');
             } catch (err) { /* localStorage may be unavailable (e.g. private mode) — safe to skip */ }
 
             const submitBtn = document.getElementById('tx-submit-btn');
@@ -3129,12 +3481,44 @@
             return cards.find(c => tx.cardId && String(c.id) === String(tx.cardId)) || cards.find(c => normCardName(c.name) === normCardName(tx.cardName));
         }
 
+        function transferPairFor(tx) {
+            const groupId = transferGroupId(tx);
+            if (!groupId) return null;
+            const pair = transactions.filter(item => transferGroupId(item) === groupId);
+            return {
+                out: pair.find(item => item.type === TRANSFER_OUT_TYPE) || null,
+                incoming: pair.find(item => item.type === TRANSFER_IN_TYPE) || null
+            };
+        }
+
         function editTransaction(id) {
             const tx = transactions.find(t => t.id === id);
             if (!tx) return;
 
+            if (isTransferType(tx.type)) {
+                const pair = transferPairFor(tx);
+                if (!pair || !pair.out || !pair.incoming) {
+                    showToast('This transfer is missing its matching entry and cannot be edited safely.', { tone: 'error' });
+                    return;
+                }
+                document.getElementById('editing-tx-id').value = pair.out.id;
+                document.getElementById('editing-transfer-peer-id').value = pair.incoming.id;
+                document.getElementById('exp-date').value = pair.out.date;
+                document.getElementById('exp-desc').value = pair.out.desc;
+                document.getElementById('exp-amount').value = pair.out.amount || '';
+                setTransactionEntryKind('transfer');
+                populateTransferCardSelects(pair.out.cardId, pair.incoming.cardId, true);
+                document.getElementById('exp-form-title').innerHTML = `<span>✏️</span> Edit Transfer`;
+                document.getElementById('tx-form-subtitle').textContent = 'Update both sides of this card transfer';
+                document.getElementById('tx-submit-btn').textContent = 'Update Transfer';
+                openTxModal(false);
+                return;
+            }
+
             document.getElementById('editing-tx-id').value = tx.id;
+            document.getElementById('editing-transfer-peer-id').value = '';
             document.getElementById('exp-date').value = tx.date;
+            setTransactionEntryKind(entryKindForType(tx.type));
             document.getElementById('exp-type').value = tx.type;
             document.getElementById('exp-desc').value = tx.desc;
             document.getElementById('exp-amount').value = tx.amount || '';
@@ -3191,8 +3575,30 @@
             const tx = transactions.find(t => t.id === id);
             if (!tx) return;
 
+            if (isTransferType(tx.type)) {
+                const pair = transferPairFor(tx);
+                if (!pair || !pair.out || !pair.incoming) {
+                    showToast('This transfer is missing its matching entry and cannot be repeated safely.', { tone: 'error' });
+                    return;
+                }
+                document.getElementById('editing-tx-id').value = '';
+                document.getElementById('editing-transfer-peer-id').value = '';
+                document.getElementById('exp-date').value = new Date().toISOString().slice(0, 10);
+                document.getElementById('exp-desc').value = pair.out.desc;
+                document.getElementById('exp-amount').value = pair.out.amount || '';
+                setTransactionEntryKind('transfer');
+                populateTransferCardSelects(pair.out.cardId, pair.incoming.cardId);
+                document.getElementById('exp-form-title').innerHTML = `<span>↻</span> Repeat Transfer`;
+                document.getElementById('tx-form-subtitle').textContent = 'Review both cards before logging the transfer';
+                document.getElementById('tx-submit-btn').textContent = 'Log Transfer';
+                openTxModal(false);
+                return;
+            }
+
             document.getElementById('editing-tx-id').value = ""; // blank = this creates a NEW transaction, not an edit
+            document.getElementById('editing-transfer-peer-id').value = '';
             document.getElementById('exp-date').value = new Date().toISOString().slice(0, 10);
+            setTransactionEntryKind(entryKindForType(tx.type));
             document.getElementById('exp-type').value = tx.type;
             document.getElementById('exp-desc').value = tx.desc;
             document.getElementById('exp-amount').value = tx.amount || '';
@@ -3224,12 +3630,23 @@
         }
 
         async function deleteTransaction(id) {
-            const ok = await showConfirm('Delete this transaction?', 'The transaction will be deleted in 5 seconds. You can undo the deletion during that time.', { confirmLabel: 'Delete' });
+            const tx = transactions.find(transaction => String(transaction.id) === String(id));
+            const pair = tx && isTransferType(tx.type) ? transferPairFor(tx) : null;
+            if (tx && transferGroupId(tx) && (!pair || !pair.out || !pair.incoming)) {
+                showToast('This transfer is missing its matching entry; it cannot be deleted as a pair.', { tone: 'error' });
+                return;
+            }
+            const ids = pair ? [pair.out.id, pair.incoming.id] : [String(id)];
+            const ok = await showConfirm(
+                pair ? 'Delete this transfer?' : 'Delete this transaction?',
+                pair ? 'Both sides of the transfer will be deleted in 5 seconds. You can undo the deletion during that time.' : 'The transaction will be deleted in 5 seconds. You can undo the deletion during that time.',
+                { confirmLabel: 'Delete' }
+            );
             if (!ok) return;
-            if (document.getElementById('editing-tx-id').value === id) {
+            if (ids.includes(document.getElementById('editing-tx-id').value)) {
                 cancelEditTransaction();
             }
-            softDeleteTransactions([id]);
+            softDeleteTransactions(ids);
         }
 
         // Logs this month's installment on an EMI purchase as a Repaid transaction (the same
@@ -3309,10 +3726,16 @@
             const card = cards.find(c => c.id === id);
             if (!card) return;
             const isLinked = t => t.cardId ? t.cardId === card.id : (t.cardName || '').trim().toLowerCase() === card.name.trim().toLowerCase();
-            const linked = transactions.filter(isLinked);
+            const linkedIds = new Set(transactions.filter(isLinked).map(t => String(t.id)));
+            transactions.filter(isLinked).forEach(tx => {
+                const groupId = transferGroupId(tx);
+                if (!groupId) return;
+                transactions.filter(item => transferGroupId(item) === groupId).forEach(item => linkedIds.add(String(item.id)));
+            });
+            const linked = transactions.filter(t => linkedIds.has(String(t.id)));
 
             const message = linked.length > 0
-                ? `Deleting "${card.name}" will also permanently delete all ${linked.length} transaction(s) logged against it, along with its saved rules. This cannot be undone.`
+                ? `Deleting "${card.name}" will also permanently delete its ${linked.length} linked transaction(s), including both sides of any card transfers, along with its saved rules. This cannot be undone.`
                 : `Are you sure you want to delete "${card.name}"?`;
 
             const ok = await showConfirm('Delete this card and its transactions?', message, { confirmLabel: 'Delete all' });
@@ -3501,29 +3924,28 @@
                 const bCatLookup = new Map([...RATE_CATEGORIES, ...TX_ONLY_CATEGORIES].map(c => [c.toLowerCase(), c]));
                 const bTypeLookup = new Map(TYPE_FILTER_OPTIONS.map(t => [t.toLowerCase(), t]));
                 const bNewCats = [], bNewTypes = [];
+                const usedCategories = [], usedTypes = [];
                 for (const t of parsed.transactions) {
-                    if (transactions.some(existing => existing.id === t.id)) continue;
                     const cat = String(t.category || '').trim();
                     if (cat) {
                         t.category = bCatLookup.get(cat.toLowerCase()) || cat;
                         if (!bCatLookup.has(cat.toLowerCase())) { bCatLookup.set(cat.toLowerCase(), cat); bNewCats.push(cat); }
+                        usedCategories.push(t.category);
                     }
                     const typ = String(t.type || '').trim();
                     if (typ) {
                         t.type = bTypeLookup.get(typ.toLowerCase()) || typ;
                         if (!bTypeLookup.has(typ.toLowerCase())) { bTypeLookup.set(typ.toLowerCase(), typ); bNewTypes.push(typ); }
+                        usedTypes.push(t.type);
                     }
+                    if (transactions.some(existing => existing.id === t.id)) continue;
                     transactions.push(t);
                     await saveTransactionToDB(t);
                 }
-                if (bNewCats.length || bNewTypes.length) {
-                    applyCustomSettings(bNewTypes, bNewCats);
-                    for (const name of bNewCats) await saveSharedOption('category', name);
-                    for (const name of bNewTypes) await saveSharedOption('transaction_type', name);
-                    refreshOptionUI();
-                }
-
-                showToast('Backup imported.', { tone: 'success' });
+                const optionsSync = await syncUsedSharedOptions(usedCategories, usedTypes);
+                showToast(optionsSync.failures
+                    ? `Backup imported, but ${optionsSync.failures} category/type option(s) could not be saved to Supabase.`
+                    : 'Backup imported.', { tone: optionsSync.failures ? 'error' : 'success', duration: optionsSync.failures ? 10000 : 4000 });
                 e.target.value = '';
                 render();
             };
@@ -3673,16 +4095,25 @@
                 select.innerHTML = `<option value="">${cards.length === 0 ? 'No cards available' : 'No active cards (all disabled)'}</option>`;
                 return;
             }
-            select.innerHTML = pool.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+            select.innerHTML = groupedCardOptions(pool);
         }
         // Editing an old transaction that belongs to a disabled card: keep that card selectable for this edit only.
         function ensureCardOption(card) {
             const select = document.getElementById('exp-card');
             if (!card || !select || [...select.options].some(o => o.value === String(card.id))) return;
+            const type = isDebit(card) ? 'Debit' : 'Credit';
+            let group = [...select.querySelectorAll('optgroup')].find(optionGroup => optionGroup.label === type);
+            if (!group) {
+                group = document.createElement('optgroup');
+                group.label = type;
+                const creditGroup = [...select.querySelectorAll('optgroup')].find(optionGroup => optionGroup.label === 'Credit');
+                if (type === 'Debit' && creditGroup) select.insertBefore(group, creditGroup);
+                else select.appendChild(group);
+            }
             const opt = document.createElement('option');
             opt.value = card.id;
             opt.textContent = `${card.name} (disabled)`;
-            select.appendChild(opt);
+            group.appendChild(opt);
         }
 
         // ---- PREMIUM CARD TILE HELPERS ----
@@ -4657,6 +5088,11 @@
             const barStyle = balance < 0 ? 'background: linear-gradient(90deg,#ef4444,#fb7185);'
                            : pct >= 90 ? 'background: linear-gradient(90deg,#f59e0b,#fbbf24);' : '';
             const balClass = balance < 0 ? 'text-red-400' : 'text-white';
+            const identityHtml = `
+                <div class="cc-footer-identity ml-auto">
+                    ${ident.tier ? `<span class="cc-pill">${escapeHtml(ident.tier)}</span>` : ''}
+                    ${networkMarkHtml(ident)}
+                </div>`;
             const row = (label, value, sign, cls) => `
                 <div class="flex justify-between"><span class="text-slate-500 dark:text-slate-400">${label}</span>
                 <span class="font-medium ${cls || 'text-slate-700 dark:text-slate-300'}">${sign} ${formatAED(value)}</span></div>`;
@@ -4665,7 +5101,6 @@
                     ${cardWatermarkHtml(theme)}
                     <div class="cc-head flex flex-wrap items-center gap-x-3 gap-y-2">
                         <span class="cc-title">${escapeHtml(ident.title)}</span>
-                        <span class="cc-pill">Debit</span>
                         <button type="button" onclick="event.stopPropagation(); debitTopUp('${c.id}')" class="cc-pay-btn cc-pay-top text-[10px] font-semibold px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 transition">Add money</button>
                         ${c.disabled ? '<span class="cc-off-pill">Disabled</span>' : ''}
                     </div>
@@ -4690,6 +5125,7 @@
                         <div class="cc-fill" style="width: ${pct}%; ${barStyle}"></div>
                     </div>
                     <div class="cc-footer-main"><span class="cc-foot">${c.last4 ? '•••• ' + escapeHtml(c.last4) : '&nbsp;'}</span>${balance < 0 ? '<span class="cc-badge red">Overdrawn</span>' : ''}</div>
+                    ${(ident.tier || ident.network) ? `<div class="cc-pay-row mt-2 justify-end">${identityHtml}</div>` : ''}
                     <div id="card-details-${c.id}" class="${openCardDetails.has(c.id) ? '' : 'hidden'} cc-more pt-4 space-y-2">
                         <details ${openCalcCards.has(c.id) ? 'open' : ''} ontoggle="setCalcOpen('${c.id}', this.open)">
                             <summary class="cursor-pointer text-[11px] text-indigo-300 hover:text-indigo-200 font-medium select-none">How it's calculated</summary>
@@ -4698,6 +5134,8 @@
                                 ${row('Deposits / top-ups', ob.repaid, '+', 'text-emerald-600')}
                                 ${row('Purchases', ob.purchases, '−')}
                                 ${row('Cash withdrawals', ob.withdrawals, '−')}
+                                ${row('Transfers in', ob.transferIn, '+', 'text-emerald-600')}
+                                ${row('Transfers out', ob.transferOut, '−')}
                                 <div class="flex justify-between pt-1 mt-1 border-t border-slate-200 dark:border-slate-600 font-semibold text-slate-800 dark:text-slate-200">
                                     <span>Balance today</span><span>= ${formatAED(balance)}</span>
                                 </div>
@@ -4796,8 +5234,8 @@
                     <span class="font-medium ${cls}">${sign} ${formatAED(value)}</span>
                 </div>`;
 
-            // Credit cards first, then debit cards; each group gets a heading when both kinds exist.
-            const orderedCards = [...visibleCards.filter(c => !isDebit(c)), ...visibleCards.filter(isDebit)];
+            // Debit cards first, then credit cards; each group gets a heading when both kinds exist.
+            const orderedCards = [...visibleCards.filter(isDebit), ...visibleCards.filter(c => !isDebit(c))];
             const tileHtml = orderedCards.map(c => {
                 const totalLimit = Number(c.availableLimit) || 0;
                 const targetLimit = totalLimit * 0.97;
@@ -4928,6 +5366,8 @@
                                     ${calcRow('Cash withdrawals', ob.withdrawals, '+')}
                                     ${INCLUDE_FEES_IN_OUTSTANDING ? calcRow('Service fees', ob.fees, '+') : ''}
                                     ${calcRow('Repaid', ob.repaid, '−', 'text-emerald-600')}
+                                    ${calcRow('Transfers in', ob.transferIn, '−', 'text-emerald-600')}
+                                    ${calcRow('Transfers out', ob.transferOut, '+')}
                                     ${calcRow('Cashback already credited', ob.cashbackCredited, '−', 'text-emerald-600')}
                                     <div class="flex justify-between pt-1 mt-1 border-t border-slate-200 dark:border-slate-600 font-semibold text-slate-800 dark:text-slate-200">
                                         <span>Outstanding today</span>
