@@ -5422,23 +5422,41 @@
                 </button>
             `;
 
-            uniqueCardNames.forEach(cardName => {
-                const isActive = activeCardFilter === cardName;
+            const cardGroups = [
+                { label: 'Credit', debit: false },
+                { label: 'Debit', debit: true }
+            ].map(group => ({
+                ...group,
+                names: uniqueCardNames.filter(name => isDebit(cards.find(card => card.name === name)) === group.debit),
+                disabledNames: [...new Set(cards
+                    .filter(card => card.disabled && isDebit(card) === group.debit)
+                    .map(card => (card.name || '').trim())
+                    .filter(Boolean))]
+            }));
+            cardGroups.forEach(group => {
+                if (!group.names.length && !group.disabledNames.length) return;
                 html += `
-                    <button onclick="setCardFilter('${cardName.replace(/'/g, "\\'")}')" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap ${isActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'}">
-                        💳 ${escapeHtml(cardName)}${offNames.has(cardName) ? ' <span class="opacity-70">· disabled</span>' : ''}
-                    </button>
+                    <div class="w-full basis-full flex items-center gap-2 pt-1" role="heading" aria-level="4">
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">${group.label}</span>
+                        <span class="h-px flex-1 bg-slate-200 dark:bg-slate-700"></span>
+                    </div>
                 `;
+                group.names.forEach(cardName => {
+                    const isActive = activeCardFilter === cardName;
+                    html += `
+                        <button onclick="setCardFilter('${cardName.replace(/'/g, "\\'")}')" class="px-3 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap ${isActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'}">
+                            💳 ${escapeHtml(cardName)}${offNames.has(cardName) ? ' <span class="opacity-70">· disabled</span>' : ''}
+                        </button>
+                    `;
+                });
+                if (group.disabledNames.length) {
+                    html += `
+                        <button onclick="setShowDisabledCards(!showDisabledCards)" title="Include disabled ${group.label.toLowerCase()} cards in the filter list"
+                            class="px-3 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap border border-dashed ${showDisabledCards ? 'border-indigo-400 text-indigo-300 bg-indigo-500/10' : 'border-slate-500/60 text-slate-400 hover:text-slate-200'}">
+                            ${showDisabledCards ? '✓ ' : ''}Show disabled (${group.disabledNames.length})
+                        </button>`;
+                }
             });
-
-            // Same switch as the Saved Cards header, kept next to the filters for convenience.
-            if (offNames.size > 0) {
-                html += `
-                    <button onclick="setShowDisabledCards(!showDisabledCards)" title="Include cards you have disabled in the filter list"
-                        class="px-3 py-1.5 text-xs font-semibold rounded-lg transition whitespace-nowrap border border-dashed ${showDisabledCards ? 'border-indigo-400 text-indigo-300 bg-indigo-500/10' : 'border-slate-500/60 text-slate-400 hover:text-slate-200'}">
-                        ${showDisabledCards ? '✓ ' : ''}Show disabled (${offNames.size})
-                    </button>`;
-            }
 
             container.innerHTML = html;
             renderHistoryCardFilter();
